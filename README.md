@@ -391,6 +391,30 @@ python tool_calls_eval.py samples.jsonl \
     --concurrency 5 \
     --extra-body '{"provider": {"only": ["YOUR_DESIGNATED_PROVIDER"]}}'
 ```
+
+测试千帆平台模型
+
+增加了以下特性：
+1. 传递extra-body，通过safety关闭思考，通过thinking开启思考
+2. 传递default-headers，搭配safety使用。
+3. nohup后台运行
+4. 只是输出内容打印到文件，并且按照时间戳命名。
+
+```bash
+nohup python -u tool_calls_eval.py samples.jsonl \
+    --model deepseek-v3.2 \
+    --base-url https://qianfan.baidubce.com/v2 \
+    --api-key YOUR_QIANFAN_API_KEY \
+    --concurrency 50 \
+    --extra-body '{"safety": {"input_level": "none"},"thinking": {"type": "enabled"}}' \
+    --default-headers '{"appid": ""}' \
+    --timeout 3000 \
+    --output results.jsonl \
+    --summary summary.json > "$(date +'%Y%m%d_%H%M%S').log" 2>&1 &
+```
+
+
+
 ## Contact Us
 **We're preparing the next benchmark round and need your input.**
 
