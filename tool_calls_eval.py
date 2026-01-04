@@ -137,6 +137,9 @@ class ToolCallsValidator:
         tokenizer_model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        # --- 新增的参数 ---
+        default_headers: Optional[Dict[str, Any]] = None,
+        # ------------------
     ):
         """
         Initialize validator.
@@ -198,6 +201,10 @@ class ToolCallsValidator:
             base_url=self.base_url,
             timeout=self.timeout,
             max_retries=self.max_retries,
+            # 设置 appid，才能让安全等级生效。
+            # --- 使用传入的参数 ---
+            default_headers=default_headers,  
+            # ----------------------
         )
 
         # Async locks
@@ -369,20 +376,35 @@ class ToolCallsValidator:
         Returns:
             Tuple of (status, response dict), status is either "success" or "failed"
         """
+
+
+
+        """
+        发送 API 请求，支持保存 reasoning_content 和 extra_body 记录。
+        """
+
         try:
             if request.get("stream", False):
-                return await self._handle_stream_request(request)
+                return await self._handle_stream_request(request) # 处理流式请求
             else:
-                # Non-stream request
+                # 非流式请求
                 if not self.use_raw_completions:
-                    response = await self.client.chat.completions.create(
+                    response_obj = await self.client.chat.completions.create(
                         **request, extra_body=self.extra_body
                     )
+                    # 转换字典并显式提取深度思考内容
+                    resp_dict = response_obj.model_dump()
+                    msg_obj = response_obj.choices[0].message
+                    if hasattr(msg_obj, "reasoning_content"):
+                        resp_dict["choices"][0]["message"]["reasoning_content"] = msg_obj.reasoning_content
                 else:
-                    response = await self.client.completions.create(
+                    response_obj = await self.client.completions.create(
                         **request, extra_body=self.extra_body
                     )
-                return "success", response.model_dump()
+                    resp_dict = response_obj.model_dump()
+                
+                # 返回时，我们可以通过某种方式把带参数的请求传回去，或者由 process_request 处理
+                return "success", resp_dict
         except Exception as e:
             logger.error(f"Request failed: {e}")
             return "failed", {"error": str(e)}
@@ -399,6 +421,10 @@ class ToolCallsValidator:
         Returns:
             Tuple of (status, response dict)
         """
+
+        """
+        处理流式请求，累加 reasoning_content 和 content。
+        """
         try:
             # Create stream request
             if not self.use_raw_completions:
@@ -414,6 +440,7 @@ class ToolCallsValidator:
             request_id = None
             created = None
             full_content = []
+            full_reasoning_content = [] # 新增：深度思考内容累加器
             tool_calls: Dict[int, Dict[str, Any]] = {}
             finish_reason = None
             usage = None
@@ -436,8 +463,13 @@ class ToolCallsValidator:
                 # Handle delta content (chat.completions)
                 if hasattr(choice, "delta") and choice.delta:
                     # Accumulate text content
+                    # 1. 提取普通文本
                     if hasattr(choice.delta, "content") and choice.delta.content:
                         full_content.append(choice.delta.content)
+
+                    # 2. 提取深度思考内容 (DeepSeek/百度千帆标准)
+                    if hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content:
+                        full_reasoning_content.append(choice.delta.reasoning_content)                   
 
                     # Accumulate tool calls
                     if hasattr(choice.delta, "tool_calls") and choice.delta.tool_calls:
@@ -457,6 +489,7 @@ class ToolCallsValidator:
 
             # Extract tool calls from text if using completions endpoint
             content_text = "".join(full_content)
+            reasoning_text = "".join(full_reasoning_content)
             if self.use_raw_completions:
                 extracted_tool_calls = extract_tool_call_info(content_text)
                 if extracted_tool_calls:
@@ -478,6 +511,7 @@ class ToolCallsValidator:
                         "message": {
                             "role": "assistant",
                             "content": content_text,
+                            "reasoning_content": reasoning_text, # 存入结果
                             "tool_calls": tool_calls_list,
                         },
                         "finish_reason": finish_reason or "stop",
@@ -536,6 +570,12 @@ class ToolCallsValidator:
             status, response = await self.send_request(prepared_req["prepared"])
             duration_ms = int((time.time() - start_time) * 1000)
 
+            # --- 在这里合并参数，用于日志记录 ---
+            final_request_for_log = prepared_req["prepared"].copy()
+            if self.extra_body:
+                final_request_for_log.update(self.extra_body)
+            # ----------------------------------
+
             finish_reason = None
             tool_calls_valid = None
 
@@ -555,7 +595,7 @@ class ToolCallsValidator:
 
             result = {
                 "data_index": data_index,
-                "request": prepared_req["prepared"],
+                "request": final_request_for_log, # 这里记录包含 extra_body 的完整参数
                 "response": response,
                 "status": status,
                 "finish_reason": finish_reason,
@@ -898,6 +938,15 @@ async def main() -> None:
         help="Extra request body parameters (JSON string)",
     )
 
+    # --- 新增的参数 ---
+    parser.add_argument(
+        "--default-headers",
+        type=str,
+        default=None,
+        help="Default HTTP headers for the API client (JSON string). E.g., '{\"appid\": \"app-123\"}'",
+    )
+    # ------------------
+
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -958,6 +1007,16 @@ async def main() -> None:
             logger.error(f"Failed to parse --extra-body JSON: {e}")
             return
 
+    # --- 新增的代码：解析 default_headers ---
+    default_headers = {}
+    if args.default_headers:
+        try:
+            default_headers = json.loads(args.default_headers)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse --default-headers JSON: {e}")
+            return
+    # ----------------------------------------
+
     async with ToolCallsValidator(
         model=args.model,
         base_url=args.base_url,
@@ -973,6 +1032,9 @@ async def main() -> None:
         tokenizer_model=args.tokenizer_model,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        # --- 传递 default_headers ---
+        default_headers=default_headers,
+        # -----------------------------
     ) as validator:
         await validator.validate_file(args.file_path)
 
